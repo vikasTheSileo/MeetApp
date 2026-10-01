@@ -1,4 +1,0 @@
-@model WebApplication2.Controllers.Credentials
-@inject IConfiguration Configuration
-@{ ViewData["Title"] = "Sign in"; }
-<main class="auth-page"><form asp-action="Login" method="post" class="auth-card"><span class="brand-icon">t</span><h1>Welcome to Together</h1><p>Your conversations, safely in one place.</p><div asp-validation-summary="All" class="error" role="alert"></div><input asp-for="ReturnUrl" type="hidden" /><label asp-for="Username">Username</label><input asp-for="Username" autocomplete="username" required maxlength="40" /><label asp-for="Password">Password</label><input asp-for="Password" type="password" autocomplete="current-password" required maxlength="128" /><button class="primary">Sign in</button>@if(Configuration.GetValue<bool>("RegistrationEnabled")){<a asp-action="Register" asp-route-returnUrl="@Model.ReturnUrl">Create an account</a>}</form></main>
