@@ -1,231 +1,254 @@
 (() => {
-    'use strict';
-    const $ = id => document.getElementById(id);
-    const app = $('app');
-    if (!app) return;
-    let connection, me, users = [], selected = 'group', joined = false, sending = false, pendingFile = null;
-    const known = new Map(), histories = new Map(), unread = new Map(), myIds = new Set(), drafts = new Map();
-    let call = null, signalQueue = Promise.resolve(), noticeTimer;
-    const MAX_FILE = 2 * 1024 * 1024;
-    const readSetting = key => { try { return localStorage.getItem(key); } catch { return null; } };
-    const saveSetting = (key, value) => { try { localStorage.setItem(key, value); } catch { /* Storage may be disabled. */ } };
-    document.body.classList.toggle('dark', readSetting('together-theme') === 'dark');
-    $('themeButton').onclick = () => { document.body.classList.toggle('dark'); saveSetting('together-theme', document.body.classList.contains('dark') ? 'dark' : 'light'); };
-    const initials = name => name.split(/\s+/).map(s => Array.from(s)[0]).slice(0, 2).join('').toUpperCase();
-    const online = id => users.some(u => u.id === id);
-    function notice(text) { $('notice').textContent = text; $('notice').hidden = false; clearTimeout(noticeTimer); noticeTimer = setTimeout(() => $('notice').hidden = true, 9000); }
-    function errorText(error) { return error.message?.split('HubException: ').pop() || 'Something went wrong. Please try again.'; }
-    function controls() {
-        const available = joined && (selected === 'group' || online(selected));
-        $('messageInput').disabled = $('attachButton').disabled = $('sendButton').disabled = !available || sending;
-        $('voiceButton').disabled = $('videoButton').disabled = !available || selected === 'group' || !!call;
-        $('voiceButton').title = $('videoButton').title = selected === 'group' ? 'Select a person to call' : 'Start a private call';
+'use strict';
+const $ = id => document.getElementById(id), app = $('app');
+if (!app) return;
+let csrf = app.dataset.csrf, data, selected = null, messages = [], canLoadOlder = false, pendingFile = null, sending = false;
+let refreshTimer, refreshing = false, refreshAgain = false, messageBusy = false, connection;
+const drafts = new Map();
+let meetingId = null, meeting = null, room = null, joining = false, wantJoined = false, updatingMeeting = false;
+const run = fn => async (...args) => { try { await fn(...args); } catch (e) { notice(e.message); } };
+function node(tag, text, className) { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (className) e.className = className; return e; }
+function button(text, fn, className) { const b = node('button', text, className); b.type = 'button'; b.onclick = run(fn); return b; }
+function notice(text) { $('notice').textContent = text; $('notice').hidden = false; }
+async function api(path, body, form = false) {
+    const headers = { 'X-CSRF-TOKEN': csrf };
+    if (body !== undefined && !form) headers['Content-Type'] = 'application/json';
+    const response = await fetch('/api/' + path, { method: body === undefined ? 'GET' : 'POST', headers, body: body === undefined ? undefined : form ? body : JSON.stringify(body), credentials: 'same-origin' });
+    if (response.status === 401) { location.href = '/Account/Login?returnUrl=' + encodeURIComponent(location.pathname); throw new Error('Your session expired. Please sign in again.'); }
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) { const e = new Error(result.error || (response.status === 429 ? 'Too many requests. Please wait a moment.' : result.title || 'Request failed. Please retry.')); e.status = response.status; throw e; }
+    if (result.cleanupPending) notice('Access changes are saved. The meeting server is temporarily unavailable; media disconnection is being retried.');
+    return result;
+}
+const current = () => data?.conversations.find(c => c.id === selected);
+const nameOf = c => c.kind === 'direct' ? (c.members.find(m => m.userId !== data.me.id)?.name || 'Direct chat') : c.name;
+const initials = name => name.trim().split(/\s+/).map(s => Array.from(s)[0]).slice(0,2).join('').toUpperCase();
+try { document.body.classList.toggle('dark', localStorage.getItem('together-theme') === 'dark'); } catch {}
+$('themeButton').onclick = () => { document.body.classList.toggle('dark'); try { localStorage.setItem('together-theme',document.body.classList.contains('dark') ? 'dark' : 'light'); } catch {} };
+function controls() {
+    const c = current(), disabled = !c || sending;
+    $('messageInput').disabled = $('sendButton').disabled = $('attachButton').disabled = disabled;
+    $('voiceButton').disabled = $('videoButton').disabled = !c || !!meetingId;
+    $('membersButton').disabled = !c || c.kind !== 'group';
+}
+function renderList() {
+    if (!data) return;
+    const list = $('conversationList'); list.replaceChildren();
+    const query = $('searchUsers').value.trim().toLowerCase();
+    for (const c of data.conversations) {
+        const name = nameOf(c); if (!name.toLowerCase().includes(query)) continue;
+        const b = button('', () => choose(c.id), 'conversation' + (selected === c.id ? ' active' : ''));
+        b.setAttribute('aria-current', String(selected === c.id));
+        b.append(node('span',c.kind === 'direct' ? initials(name) : '#','avatar'));
+        const details = node('span',undefined,'details'); details.append(node('strong',name),node('small',c.kind === 'direct' ? 'Private conversation' : `${c.members.length} members`)); b.append(details);
+        if (c.unread) b.append(node('span', String(c.unread), 'badge')); list.append(b);
     }
-    function choose(id) {
-        drafts.set(selected, { text: $('messageInput').value, file: pendingFile });
-        selected = id; unread.delete(id);
-        $('messageInput').value = drafts.get(id)?.text || ''; pendingFile = drafts.get(id)?.file || null; attachmentUi();
-        app.classList.remove('people-open'); $('peopleButton').setAttribute('aria-expanded', 'false');
-        renderList(); renderMessages(); renderHeader(); controls();
+    list.append(node('div','PEOPLE · START A DIRECT CHAT','people-label'));
+    for (const user of data.users.filter(u => u.id !== data.me.id && (u.name + ' ' + u.username).toLowerCase().includes(query))) {
+        const b = button('', async () => { const c = await api('conversations/direct',{userId:user.id}); await refresh(); await choose(c.id); }, 'conversation');
+        b.append(node('span',initials(user.name),'avatar')); const details=node('span',undefined,'details');
+        details.append(node('strong',user.name),node('small',`@${user.username} · ${data.online.includes(user.id) ? 'Online' : 'Offline'}`)); b.append(details); list.append(b);
     }
-    function renderHeader() {
-        const group = selected === 'group', person = known.get(selected);
-        $('chatTitle').textContent = group ? 'Everyone' : person?.name || 'Conversation';
-        $('chatAvatar').textContent = group ? '#' : initials(person?.name || '?');
-        $('chatSubtitle').textContent = group ? `${users.length} online · shared group chat` : online(selected) ? 'Online · private conversation' : 'Offline · select their new session if they rejoin';
-        $('roomBanner').textContent = group ? 'A shared space for the whole group. Pick someone on the left for a private conversation.' : 'Only you and this person receive messages in this conversation.';
+    const unread=data.conversations.reduce((n,c)=>n+c.unread,0);
+    $('peopleButton').textContent=unread ? `☰ ${unread}` : '☰';
+    $('onlineCount').textContent=`${data.online.length} online`;
+}
+function renderHeader() {
+    const c=current(); if (!c) return;
+    $('chatTitle').textContent=nameOf(c); $('chatAvatar').textContent=c.kind==='direct' ? initials(nameOf(c)) : '#';
+    $('chatSubtitle').textContent=c.kind==='direct' ? 'Private · saved to your account' : `${c.members.length} members · ${c.kind==='public' ? 'Shared room' : 'Private group'}`;
+    $('roomBanner').textContent=c.kind==='public' ? 'Everyone is visible to all registered users.' : 'Only current conversation members can access messages, files and meetings.';
+}
+function attachmentUi() { $('attachmentPreview').hidden=!pendingFile; $('attachmentName').textContent=pendingFile ? `${pendingFile.name} · ${Math.ceil(pendingFile.size/1024)} KB` : ''; }
+async function choose(id) {
+    if (selected) drafts.set(selected,{text:$('messageInput').value,file:pendingFile});
+    selected=id; messages=[]; $('messages').replaceChildren();
+    $('messageInput').value=drafts.get(id)?.text || ''; pendingFile=drafts.get(id)?.file || null; attachmentUi();
+    app.classList.remove('people-open'); $('peopleButton').setAttribute('aria-expanded','false');
+    renderList();renderHeader();controls(); await loadMessages(true); await listMeetings();
+}
+function renderMessages(scroll=false) {
+    const box=$('messages'), previous=box.scrollTop, oldHeight=box.scrollHeight; box.replaceChildren();
+    if (!messages.length) { const empty=node('div',undefined,'empty'); empty.append(node('div','✳','empty-icon'),node('h2','Start the conversation.'),node('p','Send a message, share a file or invite your team to a meeting.'));box.append(empty); }
+    for (const m of messages) {
+        const item=node('article',undefined,'message'+(m.senderId===data.me.id?' mine':''));
+        const meta=node('div',undefined,'message-meta'); const time=node('time',new Date(m.sentAt.endsWith('Z')?m.sentAt:m.sentAt+'Z').toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}));
+        meta.append(node('span',m.senderId===data.me.id?'You':m.senderName),time);
+        const bubble=node('div',m.text,'bubble');
+        if(m.file){const a=node('a',`↓ ${m.file.name} · ${Math.ceil(m.file.size/1024)} KB`,'file-link');a.href=m.file.url;a.download=m.file.name;bubble.append(a);}
+        item.append(meta,bubble);box.append(item);
     }
-    function renderList() {
-        $('conversationList').replaceChildren();
-        const query = $('searchUsers').value.toLowerCase();
-        const people = [...known.values()].filter(u => !myIds.has(u.id) && (online(u.id) || histories.has(u.id))).sort((a, b) => Number(online(b.id)) - Number(online(a.id)) || a.name.localeCompare(b.name));
-        for (const person of [{ id: 'group', name: 'Everyone' }, ...people]) {
-            if (person.id !== 'group' && !person.name.toLowerCase().includes(query)) continue;
-            const button = document.createElement('button'); button.type = 'button'; button.className = 'conversation' + (selected === person.id ? ' active' : ''); button.setAttribute('aria-current', String(selected === person.id));
-            const avatar = document.createElement('span'); avatar.className = 'avatar'; avatar.textContent = person.id === 'group' ? '#' : initials(person.name);
-            const details = document.createElement('span'); details.className = 'details';
-            const title = document.createElement('strong'); title.textContent = person.name;
-            const subtitle = document.createElement('small'); subtitle.textContent = person.id === 'group' ? 'The whole group, together' : online(person.id) ? '● Online' : 'Offline';
-            details.append(title, subtitle); button.append(avatar, details);
-            if (unread.get(person.id)) { const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = unread.get(person.id); button.append(badge); }
-            button.onclick = () => choose(person.id); $('conversationList').append(button);
+    $('olderButton').hidden=!canLoadOlder;
+    box.scrollTop=scroll?box.scrollHeight:previous+Math.max(0,box.scrollHeight-oldHeight);
+}
+async function loadMessages(reset=false,older=false) {
+    if (!selected) return;
+    const id=selected, cursor=older?messages[0]?.id:messages.at(-1)?.id;
+    let path=`conversations/${id}/messages`;
+    if(!reset && cursor) path+=older?`?before=${cursor}`:`?after=${cursor}`;
+    const incoming=await api(path); if(selected!==id)return;
+    if(reset) {messages=incoming;canLoadOlder=incoming.length===50;} else if(older){ messages=[...incoming,...messages];canLoadOlder=incoming.length===50; } else {
+        const existing=new Set(messages.map(m=>m.id)); messages.push(...incoming.filter(m=>!existing.has(m.id)));
+    }
+    renderMessages(reset || !older);
+    if(!older && incoming.length===50 && !reset) await loadMessages();
+    if(messages.length && document.visibilityState==='visible') {
+        await api(`conversations/${id}/read`,{messageId:messages.at(-1).id});
+        if(current()){current().unread=0;renderList();}
+    }
+}
+async function refresh() {
+    if(refreshing){refreshAgain=true;return;} refreshing=true;
+    try {
+        data=await api('bootstrap');csrf=data.csrf;
+        $('myName').textContent=data.me.name; $('myAvatar').textContent=initials(data.me.name);
+        for(const id of drafts.keys()) if(!data.conversations.some(c=>c.id===id)) drafts.delete(id);
+        if(selected && !current()){ selected=null;messages=[];pendingFile=null;attachmentUi();$('messages').replaceChildren();$('messageInput').value='';notice('Conversation access changed.'); }
+        renderList();renderHeader();controls();
+        if(!selected && data.conversations.length) await choose(data.conversations.find(c=>c.kind==='public')?.id || data.conversations[0].id);
+        else if(selected && !messageBusy){messageBusy=true;try {await loadMessages();await listMeetings();} finally{messageBusy=false;}}
+        if(meetingId)await updateMeeting();
+    } finally {refreshing=false;if(refreshAgain){refreshAgain=false;scheduleRefresh();}}
+}
+function scheduleRefresh(){clearTimeout(refreshTimer);refreshTimer=setTimeout(()=>refresh().catch(e=>notice(e.message)),180);}
+$('searchUsers').oninput=renderList;
+$('peopleButton').onclick=()=>{app.classList.toggle('people-open');$('peopleButton').setAttribute('aria-expanded',String(app.classList.contains('people-open')));};
+$('olderButton').onclick=run(()=>loadMessages(false,true));
+$('attachButton').onclick=()=>$('fileInput').click();
+$('fileInput').onchange=()=>{const f=$('fileInput').files[0];if(!f)return;if(!f.size||f.size>2097152){notice('Choose a non-empty file up to 2 MB.');return;}pendingFile=f;attachmentUi();$('fileInput').value='';};
+$('removeAttachment').onclick=()=>{pendingFile=null;attachmentUi();};
+let retryMessage=null;
+$('messageForm').onsubmit=run(async event=>{
+    event.preventDefault();if(sending||!selected)return;
+    const text=$('messageInput').value.trim(),file=pendingFile,id=selected;if(!text&&!file)return;
+    if(!retryMessage || retryMessage.id!==id || retryMessage.text!==text || retryMessage.file!==file) retryMessage={id,text,file,requestId:crypto.randomUUID()};
+    const payload=new FormData();payload.append('text',text);payload.append('requestId',retryMessage.requestId);if(file)payload.append('file',file);
+    sending=true;controls();
+    try{await api(`conversations/${id}/messages`,payload,true);retryMessage=null;drafts.delete(id);if(selected===id){$('messageInput').value='';pendingFile=null;attachmentUi();}await refresh();}
+    finally{sending=false;controls();}
+});
+$('messageInput').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('messageForm').requestSubmit();}};
+$('newGroup').onclick=()=>{
+    if(!data)return;$('groupError').textContent='';$('groupName').value='';$('groupChoices').replaceChildren();
+    for(const user of data.users.filter(u=>u.id!==data.me.id)){const row=node('div',undefined,'member-row'),label=node('label'),input=document.createElement('input');input.type='checkbox';input.value=user.id;label.append(input,node('span',`${user.name} (@${user.username})`));row.append(label);$('groupChoices').append(row);}
+    $('groupDialog').showModal();
+};
+$('cancelGroup').onclick=()=>$('groupDialog').close();
+$('groupForm').onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const c=await api('conversations/groups',{name:$('groupName').value,userIds:[...$('groupChoices').querySelectorAll('input:checked')].map(x=>x.value)});$('groupDialog').close();await refresh();await choose(c.id);}catch(error){$('groupError').textContent=error.message;}finally{b.disabled=false;}};
+function memberRows(){
+    const c=current();if(!c)return;$('memberRows').replaceChildren();$('membersTitle').textContent=c.name+' members';
+    for(const u of data.users){const member=c.members.some(m=>m.userId===u.id);if(c.ownerId!==data.me.id&&!member)continue;
+        const row=node('div',undefined,'member-row');row.append(node('span',`${u.name} (@${u.username})${u.id===c.ownerId?' · Owner':''}`));
+        if(c.ownerId===data.me.id&&u.id!==c.ownerId)row.append(button(member?'Remove':'Add',async()=>{try{await api(`conversations/${c.id}/members`,{userId:u.id,add:!member});await refresh();memberRows();}catch(e){$('memberError').textContent=e.message;}}));$('memberRows').append(row);
+    }
+}
+$('membersButton').onclick=()=>{$('memberError').textContent='';memberRows();$('membersDialog').showModal();};$('closeMembers').onclick=()=>$('membersDialog').close();
+async function listMeetings(){
+    const id=selected;if(!id)return;const list=await api(`conversations/${id}/meetings`);if(selected!==id)return;
+    $('activeMeetings').replaceChildren();for(const m of list)$('activeMeetings').append(button(`${m.video?'▣':'☎'} ${m.title}${m.locked?' · Locked':''}`,()=>openMeeting(m.id)));
+}
+async function createMeeting(video){
+    if(!current())return;
+    const result=await api('meetings',{conversationId:selected,title:nameOf(current())+(video?' video meeting':' voice meeting'),video});await openMeeting(result.id);await listMeetings();
+}
+$('voiceButton').onclick=run(()=>createMeeting(false));$('videoButton').onclick=run(()=>createMeeting(true));
+async function openMeeting(id){
+    if(meetingId&&meetingId!==id)await closeMeeting();
+    meetingId=id;wantJoined=false;$('meetingError').textContent='';$('meetingDialog').showModal();controls();await updateMeeting();
+}
+async function updateMeeting(){
+    if(!meetingId||updatingMeeting)return;updatingMeeting=true;const id=meetingId;
+    try{
+        const state=await api(`meetings/${id}`);if(meetingId!==id)return;meeting=state;
+        $('meetingTitle').textContent=state.title;$('meetingLink').value=location.origin+'/meeting/'+id;
+        const admitted=state.status==='approved',host=state.hostId===data.me.id;
+        $('meetingStatus').textContent=state.ended?'This meeting has ended.':room?'Connected':admitted?'Approved. Join when you are ready.':state.status==='pending'?'Waiting for the host to approve…':state.status==='declined'?'Your request was declined.':state.status==='removed'?'You were removed from this meeting.':state.locked?'Meeting locked. New requests are disabled.':'Request access to this meeting.';
+        $('requestJoin').hidden=state.ended||state.locked||state.status!=='none';
+        $('joinMeeting').hidden=state.ended||!admitted||!!room;
+        $('joinMeeting').disabled=joining;
+        $('hostPanel').hidden=!host||state.ended;$('lockMeeting').textContent=state.locked?'Unlock meeting':'Lock meeting';
+        $('requestRows').replaceChildren();
+        if(host)for(const r of state.requests||[]){if(r.userId===data.me.id)continue;const row=node('div',undefined,'member-row');row.append(node('span',`${r.name} · ${r.status}`));
+            const decide=decision=>async()=>{const result=await api(`meetings/${id}/decide`,{userId:r.userId,decision});if(result.cleanupPending)$('meetingError').textContent='Removal saved; server disconnection is pending. Keep this window open and retry if the server stays unavailable.';await updateMeeting();};
+            if(r.status==='pending'){const approve=button('Accept',decide('approve'));approve.disabled=state.locked;row.append(approve,button('Decline',decide('decline')));}
+            if(r.status==='approved')row.append(button('Remove',decide('remove')));$('requestRows').append(row);
         }
-        $('onlineCount').textContent = `${users.length} online`;
-        const totalUnread = [...unread.values()].reduce((sum, count) => sum + count, 0);
-        $('peopleButton').textContent = totalUnread ? `☰ ${totalUnread}` : '☰';
-        $('peopleButton').setAttribute('aria-label', totalUnread ? `Open conversations, ${totalUnread} unread messages` : 'Open conversations');
-    }
-    function renderMessages() {
-        const box = $('messages'); box.replaceChildren();
-        const messages = histories.get(selected) || [];
-        if (!messages.length) {
-            const empty = document.createElement('div'); empty.className = 'empty';
-            const icon = document.createElement('div'); icon.className = 'empty-icon'; icon.textContent = '✳';
-            const title = document.createElement('h2'); title.textContent = selected === 'group' ? 'You’re in good company.' : 'Make the first move.';
-            const detail = document.createElement('p'); detail.textContent = selected === 'group' ? 'Share a thought, send a file, or just say hello. This is where your conversations begin.' : 'Say hello, share a file, or start a voice or video call using the buttons above.';
-            empty.append(icon, title, detail); box.append(empty);
+        if(state.ended||!admitted){wantJoined=false;await disconnectRoom();}
+        else if(room&&room.name!==state.roomName){await disconnectRoom();$('meetingStatus').textContent='Membership updated. Reconnecting securely…';}
+        if(wantJoined&&!room&&!joining&&!state.ended&&admitted)await connectMeeting();
+    }catch(e){$('meetingError').textContent=e.message;if(e.status===404||e.status===403){wantJoined=false;await disconnectRoom();$('joinMeeting').hidden=$('requestJoin').hidden=$('hostPanel').hidden=true;}}
+    finally{updatingMeeting=false;}
+}
+function mediaControls(){
+    for(const id of ['muteButton','cameraButton','shareButton','leaveMeeting'])$(id).hidden=!room;
+    $('joinMeeting').hidden=!!room||!meeting||meeting.ended||meeting.status!=='approved';
+    if(room){$('muteButton').textContent=room.localParticipant.isMicrophoneEnabled?'Mute mic':'Unmute mic';$('cameraButton').textContent=room.localParticipant.isCameraEnabled?'Camera off':'Camera on';$('shareButton').textContent=room.localParticipant.isScreenShareEnabled?'Stop sharing':'Share screen';$('shareButton').disabled=!navigator.mediaDevices?.getDisplayMedia;}
+}
+let attached=[];
+function renderMedia(){
+    for(const [track,element]of attached)track.detach(element);attached=[];$('meetingStage').replaceChildren();$('participantList').replaceChildren();if(!room)return;
+    const people=[room.localParticipant,...room.remoteParticipants.values()];
+    for(const person of people){
+        $('participantList').append(node('span',`${person.name||person.identity}${person===room.localParticipant?' (you)':''} · ${person.isMicrophoneEnabled?'mic on':'muted'}`,'participant-chip'));
+        for(const publication of person.trackPublications.values()){
+            const track=publication.track;if(!track||publication.isMuted)continue;
+            if(track.kind==='audio'&&person===room.localParticipant)continue;
+            const element=track.attach();attached.push([track,element]);
+            if(track.kind==='video'){element.playsInline=true;if(person===room.localParticipant)element.muted=true;const tile=node('div',undefined,'media-tile');tile.append(element,node('span',`${person.name||person.identity}${publication.source==='screen_share'?' · Screen':''}`));$('meetingStage').append(tile);}
+            else {element.hidden=true;$('meetingStage').append(element);}
         }
-        for (const message of messages) {
-            const item = document.createElement('article'); item.className = 'message' + (myIds.has(message.sender.id) ? ' mine' : '');
-            const meta = document.createElement('div'); meta.className = 'message-meta';
-            const sender = document.createElement('span'); sender.textContent = myIds.has(message.sender.id) ? 'You' : message.sender.name;
-            const time = document.createElement('time'); time.dateTime = message.sentAt; time.textContent = new Date(message.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); meta.append(sender, time);
-            const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.textContent = message.text;
-            if (message.file) { const link = document.createElement('a'); link.className = 'file-link'; link.href = message.file.url; link.download = message.file.name; link.textContent = `↓ ${message.file.name} · ${Math.ceil(message.file.size / 1024)} KB`; bubble.append(link); }
-            item.append(meta, bubble); box.append(item);
-        }
-        box.scrollTop = box.scrollHeight;
     }
-    let storedBytes = 0;
-    const arrivalOrder = [];
-    function receive(message) {
-        known.set(message.sender.id, message.sender);
-        const key = message.recipientId == null ? 'group' : myIds.has(message.sender.id) ? message.recipientId : message.sender.id;
-        if (message.file) {
-            const bytes = Uint8Array.from(atob(message.file.data), c => c.charCodeAt(0));
-            message.file.url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' })); delete message.file.data;
-            storedBytes += bytes.length;
-        }
-        if (!histories.has(key)) histories.set(key, []);
-        histories.get(key).push(message); arrivalOrder.push({ key, message });
-        // Bound memory retained by long-running tabs, including attachment object URLs.
-        while (arrivalOrder.length > 500 || storedBytes > 24 * 1024 * 1024) {
-            const old = arrivalOrder.shift(); histories.get(old.key).shift();
-            if (old.message.file) { URL.revokeObjectURL(old.message.file.url); storedBytes -= old.message.file.size; }
-        }
-        if (key !== selected) unread.set(key, (unread.get(key) || 0) + 1);
-        renderList(); renderMessages();
-    }
-    function attachmentUi() { $('attachmentPreview').hidden = !pendingFile; $('attachmentName').textContent = pendingFile ? `${pendingFile.name} (${Math.ceil(pendingFile.size / 1024)} KB)` : ''; $('fileInput').value = ''; }
-    $('attachButton').onclick = () => $('fileInput').click();
-    $('removeAttachment').onclick = () => { pendingFile = null; attachmentUi(); };
-    $('fileInput').onchange = () => {
-        const file = $('fileInput').files[0];
-        if (!file) return;
-        if (!file.size || file.size > MAX_FILE || file.name.length > 180) { notice('Choose a non-empty file up to 2 MB, with a filename under 180 characters.'); $('fileInput').value = ''; return; }
-        pendingFile = file; attachmentUi();
-    };
-    $('messageForm').onsubmit = async event => {
-        event.preventDefault(); const text = $('messageInput').value.trim(), file = pendingFile, target = selected;
-        if (!joined || sending || (!text && !file)) return;
-        sending = true; controls();
-        try {
-            let attachment = null;
-            if (file) { const data = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result.split(',')[1]); reader.onerror = reject; reader.readAsDataURL(file); }); attachment = { name: file.name, size: file.size, data }; }
-            await connection.invoke('SendMessage', target === 'group' ? null : target, text, attachment);
-            drafts.delete(target);
-            if (selected === target) { $('messageInput').value = ''; pendingFile = null; attachmentUi(); }
-        } catch (error) { notice(errorText(error)); }
-        finally { sending = false; controls(); $('messageInput').focus(); }
-    };
-    $('messageInput').onkeydown = event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); $('messageForm').requestSubmit(); } };
-    $('searchUsers').oninput = renderList;
-    $('peopleButton').onclick = () => { app.classList.toggle('people-open'); $('peopleButton').setAttribute('aria-expanded', String(app.classList.contains('people-open'))); };
-    $('joinDialog').showModal();
-    $('joinDialog').addEventListener('cancel', event => event.preventDefault());
-    $('nameInput').value = readSetting('together-name') || '';
-    renderList(); renderMessages();
-    if (!window.signalR) { $('joinError').textContent = 'Chat could not load. Check your internet connection and refresh.'; $('joinButton').disabled = true; return; }
-    connection = new signalR.HubConnectionBuilder().withUrl(app.dataset.hubUrl).withAutomaticReconnect().build();
-    connection.on('Users', list => { users = list; for (const user of list) known.set(user.id, user); renderList(); renderHeader(); controls(); });
-    connection.on('Message', receive);
-    async function join(name) {
-        me = await connection.invoke('Join', name); myIds.add(me.id); joined = true;
-        $('myName').textContent = me.name; $('myAvatar').textContent = initials(me.name); $('connectionStatus').textContent = '● Connected';
-        saveSetting('together-name', me.name); $('joinDialog').close(); renderList(); renderHeader(); controls();
-    }
-    $('joinForm').onsubmit = async event => {
-        event.preventDefault(); $('joinButton').disabled = true; $('joinError').textContent = '';
-        try { if (connection.state === signalR.HubConnectionState.Disconnected) await connection.start(); await join($('nameInput').value.trim()); }
-        catch (error) { $('joinError').textContent = errorText(error); }
-        finally { $('joinButton').disabled = false; }
-    };
-    function disconnected(text) { joined = false; users = []; $('connectionStatus').textContent = text; finishCall(false); renderList(); renderHeader(); controls(); }
-    connection.onreconnecting(() => disconnected('Reconnecting…'));
-    connection.onreconnected(async () => { try { await join(me.name); notice('Reconnected. Messages sent while you were offline are not saved.'); } catch (error) { $('joinError').textContent = errorText(error); $('joinDialog').showModal(); } });
-    connection.onclose(() => { disconnected('Disconnected'); $('joinError').textContent = 'Connection lost. Join again to reconnect.'; if (!$('joinDialog').open) $('joinDialog').showModal(); });
-
-    function showCall(current, incoming) {
-        $('callTitle').textContent = current.peer.name; $('callKind').textContent = current.video ? 'VIDEO CALL' : 'VOICE CALL';
-        $('callStatus').textContent = incoming ? 'Incoming call…' : 'Calling…';
-        $('callDialog').classList.toggle('audio-call', !current.video);
-        $('acceptCall').hidden = !incoming; $('acceptCall').disabled = false;
-        $('hangupButton').textContent = incoming ? 'Decline' : 'End call';
-        $('muteButton').hidden = $('cameraButton').hidden = true;
-        $('muteButton').textContent = 'Mute mic'; $('cameraButton').textContent = 'Camera off';
-        $('callDialog').showModal(); controls();
-        current.timer = setTimeout(() => { if (call === current) { notice('Call timed out. Please try again.'); finishCall(true); } }, 60000);
-    }
-    async function prepare(current) {
-        if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) throw new Error('Calling requires HTTPS (or localhost) and a browser with camera/microphone support.');
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: current.video });
-        if (call !== current) { stream.getTracks().forEach(t => t.stop()); return false; }
-        current.stream = stream; $('localVideo').srcObject = stream;
-        const response = await fetch(app.dataset.configUrl);
-        if (!response.ok) throw new Error('Could not load call configuration.');
-        const config = await response.json();
-        if (call !== current) return false;
-        const pc = current.pc = new RTCPeerConnection(config);
-        stream.getTracks().forEach(track => pc.addTrack(track, stream));
-        pc.ontrack = event => { if (call === current) { $('remoteVideo').srcObject = event.streams[0]; $('remoteVideo').play().catch(() => notice('Tap the call window to enable audio.')); } };
-        pc.onicecandidate = event => { if (event.candidate && call === current) connection.invoke('Signal', current.id, 'ice', JSON.stringify(event.candidate.toJSON())).catch(error => callFailure(current, error)); };
-        pc.onconnectionstatechange = () => {
-            if (call !== current) return;
-            if (pc.connectionState === 'connected') { clearTimeout(current.timer); $('callStatus').textContent = 'Connected'; }
-            else if (pc.connectionState === 'failed') { notice('Call could not connect. Different networks may require a TURN server.'); finishCall(true); }
-            else if (pc.connectionState === 'disconnected') { $('callStatus').textContent = 'Connection interrupted…'; clearTimeout(current.timer); current.timer = setTimeout(() => { if (call === current) finishCall(true); }, 15000); }
-        };
-        $('muteButton').hidden = false; $('cameraButton').hidden = !current.video;
-        return true;
-    }
-    function callFailure(current, error) { if (call === current) { notice(error.name === 'NotAllowedError' ? 'Microphone/camera permission was denied. Allow access and try again.' : errorText(error)); finishCall(true); } }
-    async function startCall(video) {
-        if (call || !joined || selected === 'group' || !online(selected)) return;
-        if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) { notice('Calling requires HTTPS (or localhost) and a browser with camera/microphone support.'); return; }
-        const current = call = { id: crypto.randomUUID(), peer: known.get(selected), video, candidates: [] };
-        showCall(current, false);
-        try { if (!await prepare(current)) return; if (call !== current) return; await connection.invoke('StartCall', current.peer.id, current.id, video); if (call !== current) await connection.invoke('EndCall', current.id); }
-        catch (error) { callFailure(current, error); }
-    }
-    $('voiceButton').onclick = () => startCall(false); $('videoButton').onclick = () => startCall(true);
-    connection.on('IncomingCall', (id, peer, video) => {
-        if (call || !joined) { connection.invoke('EndCall', id).catch(() => {}); return; }
-        const current = call = { id, peer, video, candidates: [] }; showCall(current, true);
-    });
-    $('acceptCall').onclick = async () => {
-        const current = call; if (!current) return; $('acceptCall').disabled = true; $('callStatus').textContent = 'Connecting…';
-        try { if (!await prepare(current)) return; await connection.invoke('AcceptCall', current.id); if (call === current) { $('acceptCall').hidden = true; $('hangupButton').textContent = 'End call'; } }
-        catch (error) { callFailure(current, error); }
-    };
-    connection.on('CallAccepted', async id => {
-        const current = call; if (!current || current.id !== id) return;
-        try { $('callStatus').textContent = 'Connecting…'; const offer = await current.pc.createOffer(); if (call !== current) return; await current.pc.setLocalDescription(offer); await connection.invoke('Signal', id, 'offer', JSON.stringify(offer)); }
-        catch (error) { callFailure(current, error); }
-    });
-    connection.on('Signal', (id, kind, payload) => {
-        const current = call;
-        signalQueue = signalQueue.then(async () => {
-            if (!current || call !== current || current.id !== id || !current.pc) return;
-            const data = JSON.parse(payload), pc = current.pc;
-            if (kind === 'ice') { if (pc.remoteDescription) await pc.addIceCandidate(data); else current.candidates.push(data); return; }
-            await pc.setRemoteDescription(data);
-            for (const candidate of current.candidates.splice(0)) await pc.addIceCandidate(candidate);
-            if (kind === 'offer' && call === current) { const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); await connection.invoke('Signal', id, 'answer', JSON.stringify(answer)); }
-        }).catch(error => callFailure(current, error));
-    });
-    function finishCall(notifyPeer) {
-        const current = call; if (!current) return; call = null;
-        clearTimeout(current.timer); current.pc?.close(); current.stream?.getTracks().forEach(track => track.stop());
-        $('remoteVideo').srcObject = $('localVideo').srcObject = null;
-        $('callDialog').close(); controls();
-        if (notifyPeer && connection.state === signalR.HubConnectionState.Connected) connection.invoke('EndCall', current.id).catch(() => {});
-    }
-    connection.on('CallEnded', id => { if (call?.id === id) { finishCall(false); notice('Call ended or declined.'); } });
-    $('hangupButton').onclick = () => finishCall(true);
-    $('callDialog').addEventListener('cancel', event => { event.preventDefault(); finishCall(true); });
-    $('callDialog').addEventListener('click', () => { if ($('remoteVideo').srcObject) $('remoteVideo').play().catch(() => {}); });
-    $('muteButton').onclick = () => { const track = call?.stream?.getAudioTracks()[0]; if (track) { track.enabled = !track.enabled; $('muteButton').textContent = track.enabled ? 'Mute mic' : 'Unmute mic'; } };
-    $('cameraButton').onclick = () => { const track = call?.stream?.getVideoTracks()[0]; if (track) { track.enabled = !track.enabled; $('cameraButton').textContent = track.enabled ? 'Camera off' : 'Camera on'; } };
-    window.addEventListener('pagehide', () => { finishCall(true); connection.stop(); });
+    mediaControls();
+}
+async function connectMeeting(){
+    if(joining||room||!meetingId)return;
+    if(!window.isSecureContext||!navigator.mediaDevices){$('meetingError').textContent='Calls require HTTPS or localhost and a browser supporting media capture.';return;}
+    if(!window.LivekitClient){$('meetingError').textContent='Meeting SDK failed to load. Refresh and try again.';return;}
+    joining=true;wantJoined=true;const id=meetingId;$('joinMeeting').disabled=true;$('meetingError').textContent='';let candidate;
+    try{
+        const access=await api(`meetings/${id}/token`);if(meetingId!==id||!wantJoined)return;
+        candidate=new LivekitClient.Room({adaptiveStream:true,dynacast:true});
+        for(const event of [LivekitClient.RoomEvent.TrackSubscribed,LivekitClient.RoomEvent.TrackUnsubscribed,LivekitClient.RoomEvent.LocalTrackPublished,LivekitClient.RoomEvent.LocalTrackUnpublished,LivekitClient.RoomEvent.ParticipantConnected,LivekitClient.RoomEvent.ParticipantDisconnected,LivekitClient.RoomEvent.TrackMuted,LivekitClient.RoomEvent.TrackUnmuted]) candidate.on(event,()=>{if(room===candidate)renderMedia();});
+        candidate.on(LivekitClient.RoomEvent.Reconnecting,()=>{$('meetingStatus').textContent='Reconnecting media…';});
+        candidate.on(LivekitClient.RoomEvent.Reconnected,()=>{$('meetingStatus').textContent='Connected';renderMedia();});
+        candidate.on(LivekitClient.RoomEvent.Disconnected,()=>{if(room===candidate){room=null;renderMedia();mediaControls();$('meetingStatus').textContent='Disconnected. Checking meeting access…';scheduleRefresh();}});
+        candidate.on(LivekitClient.RoomEvent.AudioPlaybackStatusChanged,()=>{$('playAudio').hidden=candidate.canPlaybackAudio;});
+        await candidate.connect(access.url,access.token);
+        if(meetingId!==id||!wantJoined){await candidate.disconnect();return;}
+        room=candidate;mediaControls();renderMedia();
+        try{await candidate.localParticipant.setMicrophoneEnabled(true);if(meeting.video)await candidate.localParticipant.setCameraEnabled(true);}
+        catch(e){$('meetingError').textContent='Connected in listen-only mode. Allow microphone/camera access, then use the controls to enable them.';}
+        if(room===candidate){$('meetingStatus').textContent='Connected';renderMedia();}
+    }catch(e){if(candidate)await candidate.disconnect();$('meetingError').textContent=e.message;}
+    finally{joining=false;$('joinMeeting').disabled=false;mediaControls();}
+}
+async function disconnectRoom(){const old=room;room=null;for(const [track,el]of attached)track.detach(el);attached=[];if(old)await old.disconnect(true);$('meetingStage').replaceChildren();$('participantList').replaceChildren();$('playAudio').hidden=true;mediaControls();}
+async function closeMeeting(){wantJoined=false;meetingId=null;meeting=null;await disconnectRoom();$('meetingDialog').close();controls();}
+const meetingAction=fn=>async()=>{try{await fn();}catch(e){$('meetingError').textContent=e.message;}};
+$('requestJoin').onclick=meetingAction(async()=>{await api(`meetings/${meetingId}/request`,{});await updateMeeting();});
+$('joinMeeting').onclick=meetingAction(connectMeeting);
+$('closeMeeting').onclick=run(closeMeeting);$('leaveMeeting').onclick=run(closeMeeting);
+$('meetingDialog').addEventListener('cancel',e=>{e.preventDefault();closeMeeting();});
+$('copyLink').onclick=meetingAction(async()=>{try{await navigator.clipboard.writeText($('meetingLink').value);$('meetingStatus').textContent='Meeting link copied.';}catch{$('meetingLink').select();$('meetingStatus').textContent='Select and copy the meeting link above.';}});
+$('lockMeeting').onclick=meetingAction(async()=>{await api(`meetings/${meetingId}/lock`,{locked:!meeting.locked});await updateMeeting();});
+$('endMeeting').onclick=meetingAction(async()=>{const result=await api(`meetings/${meetingId}/end`,{});if(result.cleanupPending)$('meetingError').textContent='Meeting ended in the app. Media server disconnection is pending and will be retried.';await updateMeeting();});
+$('muteButton').onclick=meetingAction(async()=>{if(room)await room.localParticipant.setMicrophoneEnabled(!room.localParticipant.isMicrophoneEnabled);renderMedia();});
+$('cameraButton').onclick=meetingAction(async()=>{if(room)await room.localParticipant.setCameraEnabled(!room.localParticipant.isCameraEnabled);renderMedia();});
+$('shareButton').onclick=meetingAction(async()=>{if(room)await room.localParticipant.setScreenShareEnabled(!room.localParticipant.isScreenShareEnabled);renderMedia();});
+$('playAudio').onclick=meetingAction(async()=>{if(room)await room.startAudio();});
+async function start(){
+    await api('session',{});await refresh();
+    connection=new signalR.HubConnectionBuilder().withUrl('/chathub').withAutomaticReconnect().build();
+    connection.on('Changed',scheduleRefresh);
+    connection.onreconnecting(()=>{$('connectionStatus').textContent='Reconnecting…';});
+    connection.onreconnected(()=>{$('connectionStatus').textContent='● Connected';scheduleRefresh();});
+    connection.onclose(()=>{$('connectionStatus').textContent='Offline · retrying';});
+    try{await connection.start();$('connectionStatus').textContent='● Connected';}catch{$('connectionStatus').textContent='Live updates unavailable · retrying';}
+    const match=location.pathname.match(/^\/meeting\/([0-9a-f-]+)$/i);if(match)await openMeeting(match[1]);
+}
+setInterval(()=>{if(document.visibilityState==='visible')refresh().catch(e=>notice(e.message));if(connection?.state===signalR.HubConnectionState.Disconnected)connection.start().then(()=>{$('connectionStatus').textContent='● Connected';scheduleRefresh();}).catch(()=>{});},15000);
+setInterval(()=>{if(meetingId)updateMeeting();},5000);
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')scheduleRefresh();});
+window.addEventListener('pagehide',()=>{wantJoined=false;room?.disconnect(true);connection?.stop();});
+start().catch(e=>notice(e.message));
 })();
-

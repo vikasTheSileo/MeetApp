@@ -1,31 +1,34 @@
-@{
-    ViewData["Title"] = "Chat";
-}
-<div class="app" id="app" data-hub-url="@Url.Content("~/chathub")" data-config-url="@Url.Action("CallConfiguration", "Home")">
+@inject Microsoft.AspNetCore.Antiforgery.IAntiforgery Antiforgery
+@{ ViewData["Title"] = "Chat"; }
+<div class="app" id="app" data-csrf="@Antiforgery.GetAndStoreTokens(Context).RequestToken">
     <aside class="sidebar" id="sidebar" aria-label="Conversations">
-        <div class="brand"><span class="brand-icon">t</span><div>Together<span class="eyebrow">A little closer, from anywhere.</span></div></div>
-        <div class="profile"><span class="avatar" id="myAvatar">?</span><div><strong id="myName">Your space to connect</strong><small id="connectionStatus" role="status">Join to get started</small></div><button id="themeButton" class="icon-button" aria-label="Toggle dark theme" title="Toggle theme">◐</button></div>
-        <label class="search"><span aria-hidden="true">⌕</span><input id="searchUsers" type="search" placeholder="Find a person…" aria-label="Search people" /></label>
-        <div class="section-label">CONVERSATIONS <span id="onlineCount">0 online</span></div>
+        <div class="brand"><span class="brand-icon">t</span><div>Together<span class="eyebrow">Your team, in one place.</span></div></div>
+        <div class="profile"><span class="avatar" id="myAvatar">?</span><div><strong id="myName">Loading…</strong><small id="connectionStatus" role="status">Connecting</small></div><button id="themeButton" class="icon-button" aria-label="Toggle dark theme">◐</button></div>
+        <div class="sidebar-actions"><button id="newGroup">＋ New group</button><form asp-controller="Account" asp-action="Logout" method="post"><button>Sign out</button></form></div>
+        <label class="search"><span aria-hidden="true">⌕</span><input id="searchUsers" type="search" placeholder="Find a person or group…" aria-label="Search conversations" /></label>
+        <div class="section-label">CONVERSATIONS <span id="onlineCount"></span></div>
         <nav id="conversationList" aria-label="Select conversation"></nav>
-        <div class="sidebar-note"><span class="live-dot"></span> Made for in-the-moment conversations.<br /><small>History stays in this tab until you leave.</small></div>
+        <div class="sidebar-note">Messages and files are saved to your account.<small>Everyone is shared with all registered members.</small></div>
     </aside>
     <main class="chat">
-        <header class="chat-header"><button id="peopleButton" class="icon-button mobile-only" aria-label="Open conversations" aria-expanded="false">☰</button><span class="avatar room-avatar" id="chatAvatar">#</span><div class="chat-heading"><h1 id="chatTitle">Everyone</h1><p id="chatSubtitle">The shared room · say hello to everyone</p></div><div class="call-actions"><button id="voiceButton" title="Select a person to call" disabled>☎ <span>Voice</span></button><button id="videoButton" title="Select a person to call" disabled>▣ <span>Video</span></button></div></header>
-        <div class="room-banner" id="roomBanner">A shared space for the whole group. Pick someone on the left for a private conversation.</div>
+        <header class="chat-header"><button id="peopleButton" class="icon-button mobile-only" aria-label="Open conversations" aria-expanded="false">☰</button><span class="avatar" id="chatAvatar">#</span><div class="chat-heading"><h1 id="chatTitle">Your conversations</h1><p id="chatSubtitle">Choose a conversation</p></div><div class="call-actions"><button id="membersButton" disabled aria-label="Group members">Members</button><button id="voiceButton" disabled aria-label="Start voice meeting">☎ <span>Voice</span></button><button id="videoButton" disabled aria-label="Start video meeting">▣ <span>Video</span></button></div></header>
+        <div class="room-banner" id="roomBanner">Loading conversations…</div>
+        <div id="activeMeetings" class="active-meetings" aria-label="Active meetings"></div>
+        <button id="olderButton" class="older" hidden>Load earlier messages</button>
         <div id="messages" class="messages" role="log" aria-label="Chat messages" aria-live="polite"></div>
         <div id="notice" class="notice" role="status" hidden></div>
         <form id="messageForm" class="composer">
             <div id="attachmentPreview" class="attachment-preview" hidden><span id="attachmentName"></span><button type="button" id="removeAttachment" aria-label="Remove attachment">×</button></div>
-            <div class="composer-row"><button type="button" id="attachButton" class="icon-button" title="Attach a file (up to 2 MB)" aria-label="Attach file" disabled>＋</button><input type="file" id="fileInput" hidden /><textarea id="messageInput" rows="1" maxlength="4000" placeholder="Write a message…" aria-label="Message" disabled></textarea><button type="submit" id="sendButton" class="primary" disabled>Send <span aria-hidden="true">↗</span></button></div>
+            <div class="composer-row"><button type="button" id="attachButton" class="icon-button" aria-label="Attach file" disabled>＋</button><input type="file" id="fileInput" hidden accept=".pdf,.txt,.csv,.png,.jpg,.jpeg,.webp,.docx,.xlsx,.pptx,.zip" /><textarea id="messageInput" rows="1" maxlength="4000" placeholder="Write a message…" aria-label="Message" disabled></textarea><button type="submit" id="sendButton" class="primary" disabled>Send ↗</button></div>
             <div class="composer-hint">Enter to send · Shift + Enter for a new line <span>Files up to 2 MB</span></div>
         </form>
     </main>
 </div>
-<dialog id="joinDialog" aria-labelledby="joinTitle"><form id="joinForm"><span class="brand-icon">t</span><p class="eyebrow">WELCOME TO TOGETHER</p><h2 id="joinTitle">Good conversations<br />start with a hello.</h2><p>Choose a name so everyone knows it's you.</p><label for="nameInput">Your name</label><input id="nameInput" minlength="2" maxlength="30" required autocomplete="nickname" placeholder="e.g. Vikas" /><p id="joinError" class="error" role="alert"></p><button id="joinButton" class="primary" type="submit">Join the conversation ↗</button><small>No account needed. Names aren't verified.</small></form></dialog>
-<dialog id="callDialog" aria-labelledby="callTitle"><div class="call-content"><p class="eyebrow" id="callKind">VOICE CALL</p><h2 id="callTitle"></h2><p id="callStatus" role="status">Calling…</p><div id="videoStage" class="video-stage"><video id="remoteVideo" autoplay playsinline></video><video id="localVideo" autoplay playsinline muted></video></div><div class="call-controls"><button id="acceptCall" class="primary" hidden>Accept</button><button id="muteButton" hidden>Mute mic</button><button id="cameraButton" hidden>Camera off</button><button id="hangupButton" class="danger">End call</button></div></div></dialog>
+<dialog id="groupDialog" aria-labelledby="groupTitle"><form id="groupForm"><h2 id="groupTitle">Create a private group</h2><label for="groupName">Group name</label><input id="groupName" minlength="2" maxlength="80" required /><p>Selected members can read the group's entire saved history.</p><div id="groupChoices" class="member-choices"></div><div class="dialog-actions"><button type="button" id="cancelGroup">Cancel</button><button class="primary">Create group</button></div><p id="groupError" class="error" role="alert"></p></form></dialog>
+<dialog id="membersDialog" aria-labelledby="membersTitle"><h2 id="membersTitle">Group members</h2><p>Only the creator manages membership. Added members can read existing history. Removed members lose access.</p><div id="memberRows" class="member-choices"></div><p id="memberError" class="error" role="alert"></p><button id="closeMembers">Done</button></dialog>
+<dialog id="meetingDialog" aria-labelledby="meetingTitle"><div class="meeting-heading"><div><p class="eyebrow">TEAM MEETING</p><h2 id="meetingTitle"></h2></div><button id="closeMeeting" aria-label="Close or leave meeting">×</button></div><p id="meetingStatus" role="status"></p><div class="meeting-link"><input id="meetingLink" readonly aria-label="Meeting link" /><button id="copyLink">Copy link</button></div><p class="meeting-help">Only conversation members may request access. The host approves admission.</p><div id="meetingStage" class="meeting-stage"></div><div id="participantList" class="participant-list" aria-label="Meeting participants"></div><div class="call-controls"><button id="requestJoin" class="primary">Ask to join</button><button id="joinMeeting" class="primary" hidden>Join meeting</button><button id="muteButton" hidden>Mute mic</button><button id="cameraButton" hidden>Camera on</button><button id="shareButton" hidden>Share screen</button><button id="playAudio" hidden>Enable audio</button><button id="leaveMeeting" hidden>Leave</button></div><section id="hostPanel" hidden><h3>Host controls</h3><div class="call-controls"><button id="lockMeeting">Lock meeting</button><button id="endMeeting" class="danger">End for everyone</button></div><p>Removing someone reconnects the remaining participants securely.</p><div id="requestRows"></div></section><p id="meetingError" class="error" role="alert"></p></dialog>
 @section Scripts {
-    <script src="~/lib/signalr/signalr.min.js" defer></script>
-    <script src="~/js/site.js" asp-append-version="true" defer></script>
+<script src="~/lib/signalr/signalr.min.js" defer></script>
+<script src="~/lib/livekit/livekit-client.umd.min.js" defer></script>
+<script src="~/js/site.js" asp-append-version="true" defer></script>
 }
-
